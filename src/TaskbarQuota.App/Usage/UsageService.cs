@@ -89,11 +89,15 @@ namespace TaskbarQuota.Usage
             if (!_providers.TryGetValue(id, out var provider))
                 return UsageResult.Failure(id, "Provider not available yet.");
 
+            UsageResult? cachedResult = null;
             lock (_lock)
             {
                 if (!force && TryGetValidEntry(id, out var cached))
-                    return AttachLocalHistory(id, cached.Result.AsMemoryCache());
+                    cachedResult = cached.Result.AsMemoryCache();
             }
+            // History parsing reads every session log, so it runs outside _lock to keep UI-thread cache reads unblocked.
+            if (cachedResult is not null)
+                return AttachLocalHistory(id, cachedResult);
 
             var observationSequence = Interlocked.Increment(ref _nextObservationSequence);
             try
