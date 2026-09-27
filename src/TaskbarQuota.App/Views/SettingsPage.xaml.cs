@@ -18,6 +18,7 @@ namespace TaskbarQuota.Views
     {
         public SettingsViewModel ViewModel { get; } = new();
         private bool _isInitializing;
+        private bool _updatingStartupToggle;
         // Suppresses the Toggled handlers while a row's toggles are synced programmatically.
         private bool _suppressProviderToggleEvents;
         private bool _suppressProviderMuteEvents;
@@ -74,7 +75,7 @@ namespace TaskbarQuota.Views
                 _ => 0,
             };
             PercentageModeCombo.SelectedIndex = WidgetSettingsService.CurrentPercentageMode == PercentageDisplayMode.Remaining ? 1 : 0;
-            StartupToggle.IsOn = StartupSettingsService.IsEnabled;
+            StartupToggle.IsEnabled = false;
             ApplyQuotaAlertSettingsToControls();
             AutoHideUnavailableToggle.IsOn = WidgetSettingsService.AutoHideUnavailable;
             HideWhenUnfocusedToggle.IsOn = WidgetSettingsService.HideWhenProviderUnfocused;
@@ -82,8 +83,9 @@ namespace TaskbarQuota.Views
             RebuildProviderSettings();
             RebuildMutedProviderSettings();
             VersionLabel.Text = $"Version {AppVersion.GetDisplayLabel()}";
-            Loaded += (_, _) =>
+            Loaded += async (_, _) =>
             {
+                await RefreshStartupToggleAsync();
                 Log.Information(
                     $"Settings page loaded (surface={WidgetSettingsService.CurrentSurface}, layout={WidgetSettingsService.Current})");
                 ViewModel.ReloadProviders();
@@ -603,12 +605,57 @@ namespace TaskbarQuota.Views
             }
         }
 
-        private void OnStartupToggled(object sender, RoutedEventArgs e)
+        private async void OnStartupToggled(object sender, RoutedEventArgs e)
         {
-            if (_isInitializing)
+            if (_isInitializing || _updatingStartupToggle)
                 return;
 
-            StartupSettingsService.Apply(StartupToggle.IsOn);
+            _updatingStartupToggle = true;
+            StartupToggle.IsEnabled = false;
+            try
+            {
+                await StartupSettingsService.ApplyAsync(StartupToggle.IsOn);
+                await RefreshStartupToggleAsync();
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(ex, "Could not change startup registration");
+                await RefreshStartupToggleAsync();
+            }
+            finally
+            {
+                _updatingStartupToggle = false;
+                StartupToggle.IsEnabled = true;
+            }
+        }
+
+        private async System.Threading.Tasks.Task RefreshStartupToggleAsync()
+        {
+            _updatingStartupToggle = true;
+            StartupToggle.IsEnabled = false;
+            try
+            {
+                var status = await StartupSettingsService.ReadStatusAsync();
+                StartupToggle.IsOn = status.IsEnabled;
+                var guidance = new List<string>();
+                if (status.DisabledByUser)
+                    guidance.Add("Windows disabled this startup app. Re-enable TaskbarQuota in Windows Settings > Apps > Startup.");
+                if (status.HasOlderInstallerStartup)
+                    guidance.Add("An older TaskbarQuota installation also starts with Windows. Disable its startup entry or uninstall the older installation to avoid two widgets.");
+                StartupHelpText.Text = string.Join(" ", guidance);
+                StartupHelpText.Visibility = guidance.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(ex, "Could not read startup registration");
+                StartupToggle.IsOn = false;
+                StartupHelpText.Visibility = Visibility.Collapsed;
+            }
+            finally
+            {
+                _updatingStartupToggle = false;
+                StartupToggle.IsEnabled = true;
+            }
         }
 
         private void OnPercentageModeChanged(object sender, SelectionChangedEventArgs e)
