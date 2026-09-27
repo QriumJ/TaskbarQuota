@@ -84,16 +84,24 @@ namespace TaskbarQuota.Usage
             return false;
         }
 
-        public async Task<UsageResult> FetchAsync(ProviderId id, bool force = false, CancellationToken ct = default)
+        // Callers include UI-thread timers, and the cache-hit path can parse session history for seconds.
+        public Task<UsageResult> FetchAsync(ProviderId id, bool force = false, CancellationToken ct = default)
+            => Task.Run(() => FetchCoreAsync(id, force, ct), CancellationToken.None);
+
+        private async Task<UsageResult> FetchCoreAsync(ProviderId id, bool force, CancellationToken ct)
         {
             if (!_providers.TryGetValue(id, out var provider))
                 return UsageResult.Failure(id, "Provider not available yet.");
 
+            UsageResult? cachedResult = null;
             lock (_lock)
             {
                 if (!force && TryGetValidEntry(id, out var cached))
-                    return AttachLocalHistory(id, cached.Result.AsMemoryCache());
+                    cachedResult = cached.Result.AsMemoryCache();
             }
+            // History parsing reads every session log, so it runs outside _lock to keep UI-thread cache reads unblocked.
+            if (cachedResult is not null)
+                return AttachLocalHistory(id, cachedResult);
 
             var observationSequence = Interlocked.Increment(ref _nextObservationSequence);
             try
