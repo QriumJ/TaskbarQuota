@@ -26,6 +26,12 @@ namespace TaskbarQuota.Usage
 
         private static readonly object CacheLock = new();
         private static readonly Dictionary<ProviderId, HistoryCacheEntry> Cache = new();
+
+        internal readonly record struct FileVersion(long Length, long WriteTicks, long WalLength, long WalWriteTicks);
+
+        private sealed record FileEventsEntry(DateTime LocalDay, FileVersion Version, UsageEvent[] Events);
+
+        private static readonly Dictionary<(ProviderId Provider, string Path), FileEventsEntry> FileEvents = new();
         private static readonly Dictionary<ProviderId, object> ProviderLocks =
             Enum.GetValues<ProviderId>().ToDictionary(id => id, _ => new object());
 
@@ -48,6 +54,7 @@ namespace TaskbarQuota.Usage
             var files = DiscoverFiles(providerId).ToArray();
             if (files.Length == 0)
             {
+                PruneFileEvents(providerId, files);
                 history = new UsageHistory();
                 return false;
             }
@@ -68,12 +75,13 @@ namespace TaskbarQuota.Usage
             }
 
             var now = DateTimeOffset.Now;
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
             var events = new List<UsageEvent>();
             foreach (var file in files)
             {
                 try
                 {
-                    events.AddRange(ParseFile(providerId, file, now));
+                    events.AddRange(ParseFileCached(providerId, file, now));
                 }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
@@ -81,13 +89,81 @@ namespace TaskbarQuota.Usage
                 catch (SqliteException) { }
                 catch (InvalidOperationException) { }
             }
+            PruneFileEvents(providerId, files);
 
             history = Aggregate(events, now, SourceNote(providerId), providerId);
             var loaded = history.Last90Days is not null;
             lock (CacheLock)
                 Cache[providerId] = new HistoryCacheEntry(DateTime.Today, fingerprint.FileCount, fingerprint.TotalLength, fingerprint.LatestWriteTicks, fingerprint.PathHash, history);
-            Log.Information($"[history] provider={providerId} files={files.Length} events={events.Count} today={history.Today?.Tokens ?? 0} last90={history.Last90Days?.Tokens ?? 0} loaded={loaded}");
+            Log.Information($"[history] provider={providerId} files={files.Length} events={events.Count} today={history.Today?.Tokens ?? 0} last90={history.Last90Days?.Tokens ?? 0} loaded={loaded} elapsed={System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds:0}ms");
             return loaded;
+        }
+
+        private static UsageEvent[] ParseFileCached(ProviderId providerId, string path, DateTimeOffset now)
+        {
+            // Codex and OpenCode Go read the same session logs, so both share one unfiltered parse.
+            bool codexLog = providerId is ProviderId.Codex or ProviderId.OpenCodeGo
+                && Path.GetExtension(path).Equals(".jsonl", StringComparison.OrdinalIgnoreCase);
+            var events = ReadFileEventsCached(codexLog ? ProviderId.Codex : providerId, path, now, codexLog);
+            if (!codexLog)
+                return events;
+
+            bool openCodeGo = providerId == ProviderId.OpenCodeGo;
+            return events.Where(item => IsOpenCodeGoModel(item.Model) == openCodeGo).ToArray();
+        }
+
+        private static UsageEvent[] ReadFileEventsCached(ProviderId cacheProvider, string path, DateTimeOffset now, bool codexLog)
+        {
+            var version = ReadFileVersion(path);
+            var key = (cacheProvider, path);
+            lock (CacheLock)
+            {
+                if (FileEvents.TryGetValue(key, out var cached)
+                    && cached.LocalDay == DateTime.Today
+                    && cached.Version == version)
+                {
+                    return cached.Events;
+                }
+            }
+
+            var events = codexLog
+                ? ParseCodex(ReadSharedLines(path)).ToArray()
+                : ParseFile(cacheProvider, path, now).ToArray();
+            lock (CacheLock)
+                FileEvents[key] = new FileEventsEntry(DateTime.Today, version, events);
+            return events;
+        }
+
+        internal static FileVersion ReadFileVersion(string path)
+        {
+            var info = new FileInfo(path);
+            // SQLite in WAL mode appends to the -wal companion and leaves the main file unchanged until a checkpoint.
+            var wal = new FileInfo(path + "-wal");
+            return new FileVersion(
+                info.Length,
+                info.LastWriteTimeUtc.Ticks,
+                wal.Exists ? wal.Length : 0,
+                wal.Exists ? wal.LastWriteTimeUtc.Ticks : 0);
+        }
+
+        private static void PruneFileEvents(ProviderId providerId, IReadOnlyCollection<string> files)
+        {
+            var current = new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
+            lock (CacheLock)
+            {
+                foreach (var key in FileEvents.Keys.Where(k => k.Provider == providerId && !current.Contains(k.Path)).ToList())
+                    FileEvents.Remove(key);
+
+                // OpenCode Go parses Codex-style sessions into the shared Codex cache. It may be
+                // the only provider queried, so its file discovery must also evict deleted logs.
+                if (providerId == ProviderId.OpenCodeGo)
+                {
+                    foreach (var key in FileEvents.Keys.Where(k => k.Provider == ProviderId.Codex
+                        && Path.GetExtension(k.Path).Equals(".jsonl", StringComparison.OrdinalIgnoreCase)
+                        && !current.Contains(k.Path)).ToList())
+                        FileEvents.Remove(key);
+                }
+            }
         }
 
         private static (int FileCount, long TotalLength, long LatestWriteTicks, int PathHash) Fingerprint(IEnumerable<string> files)
@@ -441,6 +517,9 @@ namespace TaskbarQuota.Usage
             return 0;
         }
 
+        // Usage records are under 200 KB; longer lines carry embedded images and can reach tens of MB.
+        internal const int MaxHistoryLineBytes = 1024 * 1024;
+
         private static IEnumerable<string> ReadSharedLines(string path)
         {
             using var stream = new FileStream(
@@ -448,9 +527,59 @@ namespace TaskbarQuota.Usage
                 FileMode.Open,
                 FileAccess.Read,
                 FileShare.ReadWrite | FileShare.Delete);
-            using var reader = new StreamReader(stream);
-            while (reader.ReadLine() is { } line)
+            foreach (var line in ReadBoundedLines(stream, MaxHistoryLineBytes))
                 yield return line;
+        }
+
+        internal static IEnumerable<string> ReadBoundedLines(Stream stream, int maxLineBytes)
+        {
+            var buffer = new byte[64 * 1024];
+            var line = new MemoryStream();
+            bool skipping = false;
+            int read;
+            while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                int start = 0;
+                for (int i = 0; i < read; i++)
+                {
+                    if (buffer[i] != (byte)'\n')
+                        continue;
+
+                    if (!skipping && line.Length + (i - start) <= maxLineBytes)
+                    {
+                        line.Write(buffer, start, i - start);
+                        yield return DecodeLine(line);
+                    }
+                    line.SetLength(0);
+                    skipping = false;
+                    start = i + 1;
+                }
+
+                if (skipping)
+                    continue;
+                if (line.Length + (read - start) > maxLineBytes)
+                {
+                    line.SetLength(0);
+                    skipping = true;
+                }
+                else
+                {
+                    line.Write(buffer, start, read - start);
+                }
+            }
+
+            if (!skipping && line.Length > 0)
+                yield return DecodeLine(line);
+        }
+
+        private static string DecodeLine(MemoryStream line)
+        {
+            var bytes = line.GetBuffer().AsSpan(0, (int)line.Length);
+            if (bytes.Length > 0 && bytes[^1] == (byte)'\r')
+                bytes = bytes[..^1];
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+                bytes = bytes[3..];
+            return System.Text.Encoding.UTF8.GetString(bytes);
         }
 
         private static string ReadSharedText(string path)
